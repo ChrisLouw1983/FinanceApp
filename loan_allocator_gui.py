@@ -4,10 +4,12 @@ This tool allows a user to select two Excel files:
 1. Submission: contains loan information with instalments.
 2. Collected: contains payments received.
 
-Payments are allocated to the submission records by matching
-ID NUMBER first, then EMPLOYEE NUMBER. Each record's PAID amount
-is capped at the INSTALMENT AMOUNT. A DIFF column representing
-the outstanding amount is added/updated.
+Payments are allocated to the submission records sequentially by
+processing each row of the collected sheet. Allocation prioritises
+matching on ID NUMBER and falls back to EMPLOYEE NUMBER when
+capacity remains. Each record's PAID amount is capped at the
+INSTALMENT AMOUNT and any unallocated balance is reported. A DIFF
+column representing the outstanding amount is added/updated.
 
 Results are saved to an Excel file chosen by the user and a
 summary is displayed.
@@ -38,6 +40,7 @@ else:
 class AllocationResult:
     records: int
     total_paid: float
+    leftover: float
     output_path: str
 
 
@@ -141,7 +144,10 @@ class LoanAllocatorGUI(tk.Tk):
             df_sub.to_excel(save_path, index=False)
             self.output_path = save_path
             self.progress["value"] = 100
-            self.summary_var.set(f"Processed {result.records} records. Total paid: {result.total_paid:.2f}")
+            self.summary_var.set(
+                f"Processed {result.records} collected records. Allocated: {result.total_paid:.2f}. "
+                f"Unallocated: {result.leftover:.2f}"
+            )
             messagebox.showinfo("Success", f"Output saved to {save_path}")
         except Exception as exc:
             messagebox.showerror("Error", f"Failed to save output: {exc}")
@@ -162,38 +168,59 @@ class LoanAllocatorGUI(tk.Tk):
 
         df_sub["DIFF"] = df_sub["INSTALMENT AMOUNT"] - df_sub["PAID"]
 
-        payments_by_id = df_col.groupby("ID NUMBER")["PAID"].sum().to_dict()
-        payments_by_emp = df_col.groupby("EMPLOYEE NUMBER")["PAID"].sum().to_dict()
+        total_collected = float(df_col["PAID"].sum())
+        leftover = 0.0
 
-        total_paid = 0.0
+        records = len(df_col)
+        for i, col_row in df_col.iterrows():
+            amount = float(col_row["PAID"])
+            id_number = col_row["ID NUMBER"]
+            emp_number = col_row["EMPLOYEE NUMBER"]
 
-        for idx in df_sub.index:
-            row = df_sub.loc[idx]
-            instalment = float(row["INSTALMENT AMOUNT"])
-            paid = float(row["PAID"])
-            id_number = row["ID NUMBER"]
-            emp_number = row["EMPLOYEE NUMBER"]
-            # allocate by ID
-            available = payments_by_id.get(id_number, 0.0)
-            if available > 0:
-                needed = instalment - paid
-                alloc = min(needed, available)
+            id_matches = df_sub.index[df_sub["ID NUMBER"] == id_number].tolist()
+            for idx in id_matches:
+                if amount <= 0:
+                    break
+                inst = float(df_sub.at[idx, "INSTALMENT AMOUNT"])
+                paid = float(df_sub.at[idx, "PAID"])
+                remaining = inst - paid
+                if remaining <= 0:
+                    continue
+                alloc = min(remaining, amount)
                 paid += alloc
-                payments_by_id[id_number] = available - alloc
-            # allocate by employee number
-            if paid < instalment:
-                available = payments_by_emp.get(emp_number, 0.0)
-                if available > 0:
-                    needed = instalment - paid
-                    alloc = min(needed, available)
-                    paid += alloc
-                    payments_by_emp[emp_number] = available - alloc
-            paid = min(paid, instalment)
-            df_sub.at[idx, "PAID"] = paid
-            df_sub.at[idx, "DIFF"] = instalment - paid
-            total_paid += paid
+                amount -= alloc
+                df_sub.at[idx, "PAID"] = paid
+                df_sub.at[idx, "DIFF"] = inst - paid
 
-        return AllocationResult(records=len(df_sub), total_paid=total_paid, output_path="")
+            if amount > 0:
+                emp_matches = df_sub.index[df_sub["EMPLOYEE NUMBER"] == emp_number].tolist()
+                for idx in emp_matches:
+                    if amount <= 0:
+                        break
+                    inst = float(df_sub.at[idx, "INSTALMENT AMOUNT"])
+                    paid = float(df_sub.at[idx, "PAID"])
+                    remaining = inst - paid
+                    if remaining <= 0:
+                        continue
+                    alloc = min(remaining, amount)
+                    paid += alloc
+                    amount -= alloc
+                    df_sub.at[idx, "PAID"] = paid
+                    df_sub.at[idx, "DIFF"] = inst - paid
+
+            if amount > 0:
+                leftover += amount
+
+            if records:
+                self.progress["value"] = 30 + 50 * ((i + 1) / records)
+                self.update_idletasks()
+
+        total_paid = float(df_sub["PAID"].sum())
+
+        if abs(total_paid - (total_collected - leftover)) > 1e-6:
+            raise ValueError("Allocation mismatch between collected and allocated totals.")
+
+        return AllocationResult(records=records, total_paid=total_paid, leftover=leftover, output_path="")
 
     def open_output_folder(self) -> None:
         if not self.output_path:
